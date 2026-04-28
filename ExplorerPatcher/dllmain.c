@@ -116,6 +116,9 @@ BOOL bDoNotRedirectNotificationIconsToSettingsApp = FALSE;
 BOOL bDisableOfficeHotkeys = FALSE;
 BOOL bDisableWinFHotkey = FALSE;
 DWORD bNoPropertiesInContextMenu = FALSE;
+DWORD bBetterFileSizesInDetails = TRUE;
+DWORD bBetterFileSizesUseIecTerms = FALSE;
+DWORD bEverythingFolderSizes = TRUE;
 HMODULE hModule = NULL;
 HANDLE hShell32 = NULL;
 // HANDLE hDelayedInjectionThread = NULL;
@@ -5845,6 +5848,33 @@ void WINAPI LoadSettings(LPARAM lParam)
         dwSize = sizeof(DWORD);
         RegQueryValueExW(
             hKey,
+            TEXT("BetterFileSizesInDetails"),
+            0,
+            NULL,
+            &bBetterFileSizesInDetails,
+            &dwSize
+        );
+        dwSize = sizeof(DWORD);
+        RegQueryValueExW(
+            hKey,
+            TEXT("BetterFileSizesUseIecTerms"),
+            0,
+            NULL,
+            &bBetterFileSizesUseIecTerms,
+            &dwSize
+        );
+        dwSize = sizeof(DWORD);
+        RegQueryValueExW(
+            hKey,
+            TEXT("EverythingFolderSizes"),
+            0,
+            NULL,
+            &bEverythingFolderSizes,
+            &dwSize
+        );
+        dwSize = sizeof(DWORD);
+        RegQueryValueExW(
+            hKey,
             TEXT("FileExplorerCommandUI"),
             0,
             NULL,
@@ -8483,6 +8513,221 @@ __declspec(dllexport) HRESULT explorer_CoCreateInstanceHook(REFCLSID rclsid, LPU
 
 
 #pragma region "Explorer Registry Hooks"
+typedef void(WINAPI* Everything_SetSearchW_t)(LPCWSTR lpSearchString);
+typedef void(WINAPI* Everything_SetMatchPath_t)(BOOL bEnable);
+typedef void(WINAPI* Everything_SetRequestFlags_t)(DWORD dwRequestFlags);
+typedef void(WINAPI* Everything_SetMax_t)(DWORD dwMax);
+typedef BOOL(WINAPI* Everything_Query_t)(BOOL bWait);
+typedef DWORD(WINAPI* Everything_GetNumResults_t)(void);
+typedef void(WINAPI* Everything_GetResultFullPathNameW_t)(DWORD nIndex, LPWSTR lpString, DWORD nMaxCount);
+typedef BOOL(WINAPI* Everything_GetResultSize_t)(DWORD nIndex, PLARGE_INTEGER lpFileSize);
+
+typedef struct _EverythingApi
+{
+    HMODULE hModule;
+    Everything_SetSearchW_t SetSearchW;
+    Everything_SetMatchPath_t SetMatchPath;
+    Everything_SetRequestFlags_t SetRequestFlags;
+    Everything_SetMax_t SetMax;
+    Everything_Query_t Query;
+    Everything_GetNumResults_t GetNumResults;
+    Everything_GetResultFullPathNameW_t GetResultFullPathNameW;
+    Everything_GetResultSize_t GetResultSize;
+} EverythingApi;
+
+static EverythingApi g_EverythingApi = { 0 };
+static CRITICAL_SECTION g_EverythingLock;
+static INIT_ONCE g_EverythingLockInitOnce = INIT_ONCE_STATIC_INIT;
+
+BOOL CALLBACK InitEverythingLock(PINIT_ONCE InitOnce, PVOID Parameter, PVOID* Context)
+{
+    UNREFERENCED_PARAMETER(InitOnce);
+    UNREFERENCED_PARAMETER(Parameter);
+    UNREFERENCED_PARAMETER(Context);
+    InitializeCriticalSection(&g_EverythingLock);
+    return TRUE;
+}
+
+BOOL LoadEverythingApi()
+{
+    if (g_EverythingApi.hModule)
+    {
+        return TRUE;
+    }
+
+    HMODULE hEverything = LoadLibraryW(L"Everything64.dll");
+    if (!hEverything)
+    {
+        hEverything = LoadLibraryW(L"Everything32.dll");
+    }
+    if (!hEverything)
+    {
+        hEverything = LoadLibraryW(L"Everything.dll");
+    }
+    if (!hEverything)
+    {
+        return FALSE;
+    }
+
+    g_EverythingApi.SetSearchW = (Everything_SetSearchW_t)GetProcAddress(hEverything, "Everything_SetSearchW");
+    g_EverythingApi.SetMatchPath = (Everything_SetMatchPath_t)GetProcAddress(hEverything, "Everything_SetMatchPath");
+    g_EverythingApi.SetRequestFlags = (Everything_SetRequestFlags_t)GetProcAddress(hEverything, "Everything_SetRequestFlags");
+    g_EverythingApi.SetMax = (Everything_SetMax_t)GetProcAddress(hEverything, "Everything_SetMax");
+    g_EverythingApi.Query = (Everything_Query_t)GetProcAddress(hEverything, "Everything_QueryW");
+    if (!g_EverythingApi.Query)
+    {
+        g_EverythingApi.Query = (Everything_Query_t)GetProcAddress(hEverything, "Everything_Query");
+    }
+    g_EverythingApi.GetNumResults = (Everything_GetNumResults_t)GetProcAddress(hEverything, "Everything_GetNumResults");
+    g_EverythingApi.GetResultFullPathNameW = (Everything_GetResultFullPathNameW_t)GetProcAddress(hEverything, "Everything_GetResultFullPathNameW");
+    g_EverythingApi.GetResultSize = (Everything_GetResultSize_t)GetProcAddress(hEverything, "Everything_GetResultSize");
+
+    if (!g_EverythingApi.SetSearchW
+        || !g_EverythingApi.SetMatchPath
+        || !g_EverythingApi.SetRequestFlags
+        || !g_EverythingApi.SetMax
+        || !g_EverythingApi.Query
+        || !g_EverythingApi.GetNumResults
+        || !g_EverythingApi.GetResultFullPathNameW
+        || !g_EverythingApi.GetResultSize)
+    {
+        FreeLibrary(hEverything);
+        ZeroMemory(&g_EverythingApi, sizeof(g_EverythingApi));
+        return FALSE;
+    }
+
+    g_EverythingApi.hModule = hEverything;
+    return TRUE;
+}
+
+BOOL TryGetFolderSizeFromEverything(LPCWSTR folderPath, ULONGLONG* sizeOut)
+{
+    if (!folderPath || !sizeOut || !bEverythingFolderSizes)
+    {
+        return FALSE;
+    }
+
+    InitOnceExecuteOnce(&g_EverythingLockInitOnce, InitEverythingLock, NULL, NULL);
+
+    if (!LoadEverythingApi())
+    {
+        return FALSE;
+    }
+
+    WCHAR search[2048];
+    swprintf_s(search, ARRAYSIZE(search), L"folder:\"%s\"", folderPath);
+
+    EnterCriticalSection(&g_EverythingLock);
+
+    g_EverythingApi.SetSearchW(search);
+    g_EverythingApi.SetMatchPath(TRUE);
+    g_EverythingApi.SetRequestFlags(0x00000010 | 0x00000004);
+    g_EverythingApi.SetMax(4);
+
+    BOOL bOk = FALSE;
+    if (g_EverythingApi.Query(TRUE))
+    {
+        DWORD resultCount = g_EverythingApi.GetNumResults();
+        WCHAR fullPath[MAX_PATH * 4];
+        for (DWORD i = 0; i < resultCount; i++)
+        {
+            ZeroMemory(fullPath, sizeof(fullPath));
+            g_EverythingApi.GetResultFullPathNameW(i, fullPath, ARRAYSIZE(fullPath));
+            if (!_wcsicmp(fullPath, folderPath))
+            {
+                LARGE_INTEGER liSize;
+                if (g_EverythingApi.GetResultSize(i, &liSize))
+                {
+                    *sizeOut = (ULONGLONG)liSize.QuadPart;
+                    bOk = TRUE;
+                }
+                break;
+            }
+        }
+    }
+
+    LeaveCriticalSection(&g_EverythingLock);
+    return bOk;
+}
+
+BOOL(WINAPI* explorer_GetFileAttributesExWFunc)(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID) = GetFileAttributesExW;
+
+BOOL WINAPI explorer_GetFileAttributesExWHook(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation)
+{
+    BOOL bResult = explorer_GetFileAttributesExWFunc(lpFileName, fInfoLevelId, lpFileInformation);
+    if (!bResult || !lpFileInformation || fInfoLevelId != GetFileExInfoStandard)
+    {
+        return bResult;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA* pInfo = (WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation;
+    if (!(pInfo->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        return bResult;
+    }
+
+    ULONGLONG size = 0;
+    if (TryGetFolderSizeFromEverything(lpFileName, &size))
+    {
+        pInfo->nFileSizeLow = (DWORD)(size & 0xFFFFFFFF);
+        pInfo->nFileSizeHigh = (DWORD)(size >> 32);
+    }
+
+    return bResult;
+}
+
+PWSTR(WINAPI* explorer_StrFormatByteSizeWFunc)(LONGLONG qdw, PWSTR pszBuf, UINT cchBuf) = StrFormatByteSizeW;
+PWSTR(WINAPI* explorer_StrFormatKBSizeWFunc)(LONGLONG qdw, PWSTR pszBuf, UINT cchBuf) = StrFormatKBSizeW;
+
+PWSTR WINAPI explorer_StrFormatByteSizeWHook(LONGLONG qdw, PWSTR pszBuf, UINT cchBuf)
+{
+    if (!pszBuf || cchBuf == 0 || !bBetterFileSizesInDetails)
+    {
+        return explorer_StrFormatByteSizeWFunc(qdw, pszBuf, cchBuf);
+    }
+
+    static const WCHAR* rgUnits[] = { L"B", L"KB", L"MB", L"GB", L"TB", L"PB", L"EB" };
+    static const WCHAR* rgIecUnits[] = { L"B", L"KiB", L"MiB", L"GiB", L"TiB", L"PiB", L"EiB" };
+    const WCHAR** pUnits = bBetterFileSizesUseIecTerms ? rgIecUnits : rgUnits;
+
+    int unit = 0;
+    double value = (double)qdw;
+    while (unit < ARRAYSIZE(rgUnits) - 1 && value >= 1024.0)
+    {
+        value /= 1024.0;
+        unit++;
+    }
+
+    if (unit == 0)
+    {
+        swprintf_s(pszBuf, cchBuf, L"%lld %ls", qdw, pUnits[unit]);
+    }
+    else if (value >= 100.0 || unit == 1)
+    {
+        swprintf_s(pszBuf, cchBuf, L"%.0f %ls", value, pUnits[unit]);
+    }
+    else if (value >= 10.0)
+    {
+        swprintf_s(pszBuf, cchBuf, L"%.1f %ls", value, pUnits[unit]);
+    }
+    else
+    {
+        swprintf_s(pszBuf, cchBuf, L"%.2f %ls", value, pUnits[unit]);
+    }
+
+    return pszBuf;
+}
+
+PWSTR WINAPI explorer_StrFormatKBSizeWHook(LONGLONG qdw, PWSTR pszBuf, UINT cchBuf)
+{
+    if (!bBetterFileSizesInDetails)
+    {
+        return explorer_StrFormatKBSizeWFunc(qdw, pszBuf, cchBuf);
+    }
+
+    return explorer_StrFormatByteSizeWHook(qdw, pszBuf, cchBuf);
+}
+
 LSTATUS explorer_RegCreateKeyExW(
     HKEY hKey,
     LPCWSTR lpSubKey,
@@ -10883,6 +11128,9 @@ DWORD Inject(BOOL bIsExplorer)
     VnPatchIAT(hExplorer, "API-MS-WIN-CORE-REGISTRY-L1-1-0.DLL", "RegOpenKeyExW", explorer_RegOpenKeyExW);
     VnPatchIAT(hExplorer, "shell32.dll", (LPCSTR)85, explorer_OpenRegStream);
     VnPatchIAT(hExplorer, "user32.dll", "TrackPopupMenuEx", explorer_TrackPopupMenuExHook);
+    VnPatchIAT(hExplorer, "kernel32.dll", "GetFileAttributesExW", explorer_GetFileAttributesExWHook);
+    VnPatchIAT(hExplorer, "shlwapi.dll", "StrFormatByteSizeW", explorer_StrFormatByteSizeWHook);
+    VnPatchIAT(hExplorer, "shlwapi.dll", "StrFormatKBSizeW", explorer_StrFormatKBSizeWHook);
     HOOK_IMMERSIVE_MENUS(Explorer);
     VnPatchIAT(hExplorer, "uxtheme.dll", "OpenThemeDataForDpi", explorer_OpenThemeDataForDpi);
     VnPatchIAT(hExplorer, "uxtheme.dll", "DrawThemeBackground", explorer_DrawThemeBackground);
